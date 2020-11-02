@@ -1497,6 +1497,7 @@ dependencies = [
 name = "wgpu-experiments"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "wgpu",
  "winit",
  "winit_input_helper",
