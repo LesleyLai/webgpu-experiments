@@ -1,8 +1,7 @@
 use futures::executor::block_on;
-use winit::event::{Event, VirtualKeyCode, WindowEvent};
+use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
-use winit_input_helper::WinitInputHelper;
 
 struct State {
     surface: wgpu::Surface,
@@ -102,8 +101,6 @@ impl State {
 }
 
 fn main() {
-    let mut input = WinitInputHelper::new();
-
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("WebGPU Experiments!")
@@ -112,28 +109,31 @@ fn main() {
 
     let mut state = block_on(State::new(&window));
 
-    event_loop.run(move |event, _, control_flow| {
-        if input.update(&event) {
-            if input.key_released(VirtualKeyCode::Escape) || input.quit() {
-                *control_flow = ControlFlow::Exit;
-                return;
-            }
+    event_loop.run(move |event, _, control_flow| match event {
+        Event::RedrawRequested(_) => {
+            state.render();
         }
-
-        match event {
-            Event::RedrawRequested(_) => {
-                state.render();
-            }
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::Resized(physical_size) => {
-                    state.resize(physical_size);
-                }
+        Event::WindowEvent { event, .. } => match event {
+            WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+            WindowEvent::KeyboardInput { input, .. } => match input {
+                KeyboardInput {
+                    state: ElementState::Pressed,
+                    virtual_keycode: Some(VirtualKeyCode::Escape),
+                    ..
+                } => *control_flow = ControlFlow::Exit,
                 _ => {}
             },
-            Event::MainEventsCleared => {
-                window.request_redraw();
+            WindowEvent::Resized(physical_size) => {
+                state.resize(physical_size);
+            }
+            WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                state.resize(*new_inner_size);
             }
             _ => {}
+        },
+        Event::MainEventsCleared => {
+            window.request_redraw();
         }
+        _ => {}
     });
 }
