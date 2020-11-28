@@ -1,60 +1,27 @@
-mod texture;
+use std::iter;
 
 use cgmath::prelude::*;
-use futures::executor::block_on;
 use wgpu::util::DeviceExt;
-use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoop};
-use winit::window::{Window, WindowBuilder};
+use winit::{
+    event::*,
+    event_loop::{ControlFlow, EventLoop},
+    window::Window,
+};
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-struct Vertex {
-    position: [f32; 3],
-    tex_coords: [f32; 2],
-}
+mod model;
+mod texture;
 
-unsafe impl bytemuck::Pod for Vertex {}
-
-unsafe impl bytemuck::Zeroable for Vertex {}
+use model::{DrawModel, Vertex};
 
 #[rustfmt::skip]
-const VERTICES: &[Vertex] = &[
-    // Changed
-    Vertex { position: [-0.0868241, 0.49240386, 0.0], tex_coords: [0.4131759, 0.00759614] },
-    Vertex { position: [-0.49513406, 0.06958647, 0.0], tex_coords: [0.0048659444, 0.43041354] },
-    Vertex { position: [-0.21918549, -0.44939706, 0.0], tex_coords: [0.28081453, 0.949397057] },
-    Vertex { position: [0.35966998, -0.3473291, 0.0], tex_coords: [0.85967, 0.84732911] },
-    Vertex { position: [0.44147372, 0.2347359, 0.0], tex_coords: [0.9414737, 0.2652641] },
-];
+pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 0.5, 0.0,
+    0.0, 0.0, 0.5, 1.0,
+);
 
-#[rustfmt::skip]
-const INDICES: &[u16] = &[
-    0, 1, 4,
-    1, 2, 4,
-    2, 3, 4,
-];
-
-impl Vertex {
-    fn desc<'a>() -> wgpu::VertexBufferDescriptor<'a> {
-        wgpu::VertexBufferDescriptor {
-            stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::InputStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttributeDescriptor {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float3,
-                },
-                wgpu::VertexAttributeDescriptor {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float2,
-                },
-            ],
-        }
-    }
-}
+const NUM_INSTANCES_PER_ROW: u32 = 10;
 
 struct Camera {
     eye: cgmath::Point3<f32>,
@@ -66,19 +33,33 @@ struct Camera {
     zfar: f32,
 }
 
-#[rustfmt::skip]
-pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 0.5, 0.0,
-    0.0, 0.0, 0.5, 1.0,
-);
-
 impl Camera {
     fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
         let view = cgmath::Matrix4::look_at(self.eye, self.target, self.up);
         let proj = cgmath::perspective(cgmath::Deg(self.fovy), self.aspect, self.znear, self.zfar);
-        return OPENGL_TO_WGPU_MATRIX * proj * view;
+        proj * view
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct Uniforms {
+    view_proj: [[f32; 4]; 4],
+}
+
+unsafe impl bytemuck::Pod for Uniforms {}
+
+unsafe impl bytemuck::Zeroable for Uniforms {}
+
+impl Uniforms {
+    fn new() -> Self {
+        Self {
+            view_proj: cgmath::Matrix4::identity().into(),
+        }
+    }
+
+    fn update_view_proj(&mut self, camera: &Camera) {
+        self.view_proj = (OPENGL_TO_WGPU_MATRIX * camera.build_view_projection_matrix()).into();
     }
 }
 
@@ -181,53 +162,51 @@ impl CameraController {
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-struct Uniforms {
-    view_proj: [[f32; 4]; 4],
-}
-
-impl Uniforms {
-    fn new() -> Self {
-        Self {
-            view_proj: cgmath::Matrix4::identity().into(),
-        }
-    }
-
-    fn update_view_proj(&mut self, camera: &Camera) {
-        self.view_proj = camera.build_view_projection_matrix().into();
-    }
-}
-
-unsafe impl bytemuck::Pod for Uniforms {}
-
-unsafe impl bytemuck::Zeroable for Uniforms {}
-
 struct Instance {
     position: cgmath::Vector3<f32>,
     rotation: cgmath::Quaternion<f32>,
 }
 
+impl Instance {
+    fn to_raw(&self) -> InstanceRaw {
+        InstanceRaw {
+            model: (cgmath::Matrix4::from_translation(self.position)
+                * cgmath::Matrix4::from(self.rotation))
+            .into(),
+        }
+    }
+}
+
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 struct InstanceRaw {
+    #[allow(dead_code)]
     model: [[f32; 4]; 4],
 }
+
+unsafe impl bytemuck::Pod for InstanceRaw {}
+
+unsafe impl bytemuck::Zeroable for InstanceRaw {}
 
 impl InstanceRaw {
     fn desc<'a>() -> wgpu::VertexBufferDescriptor<'a> {
         use std::mem;
         wgpu::VertexBufferDescriptor {
             stride: mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
+            // We need to switch from using a step mode of Vertex to Instance
+            // This means that our shaders will only change to use the next
+            // instance when the shader starts processing a new instance
             step_mode: wgpu::InputStepMode::Instance,
             attributes: &[
-                // A mat4 takes up 4 vertex slots as it is technically 4 vec4s. We need to define a slot
-                // for each vec4. We don't have to do this in code though.
                 wgpu::VertexAttributeDescriptor {
                     offset: 0,
+                    // While our vertex shader only uses locations 0, and 1 now, in later tutorials we'll
+                    // be using 2, 3, and 4, for Vertex. We'll start at slot 5 not conflict with them later
                     shader_location: 5,
                     format: wgpu::VertexFormat::Float4,
                 },
+                // A mat4 takes up 4 vertex slots as it is technically 4 vec4s. We need to define a slot
+                // for each vec4. We don't have to do this in code though.
                 wgpu::VertexAttributeDescriptor {
                     offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
                     shader_location: 6,
@@ -248,46 +227,32 @@ impl InstanceRaw {
     }
 }
 
-unsafe impl bytemuck::Pod for InstanceRaw {}
-
-unsafe impl bytemuck::Zeroable for InstanceRaw {}
-
-impl Instance {
-    fn to_raw(&self) -> InstanceRaw {
-        InstanceRaw {
-            model: (cgmath::Matrix4::from_translation(self.position)
-                * cgmath::Matrix4::from(self.rotation))
-            .into(),
-        }
-    }
-}
-
 struct State {
     surface: wgpu::Surface,
     device: wgpu::Device,
     queue: wgpu::Queue,
     sc_desc: wgpu::SwapChainDescriptor,
     swap_chain: wgpu::SwapChain,
-    size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
-    depth_texture: texture::Texture,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    indices_count: u32,
-    diffuse_bind_group: wgpu::BindGroup,
-    diffuse_texture: texture::Texture,
+    obj_model: model::Model,
     camera: Camera,
     camera_controller: CameraController,
     uniforms: Uniforms,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     instances: Vec<Instance>,
+    #[allow(dead_code)]
     instance_buffer: wgpu::Buffer,
+    depth_texture: texture::Texture,
+    size: winit::dpi::PhysicalSize<u32>,
 }
 
 impl State {
     async fn new(window: &Window) -> Self {
         let size = window.inner_size();
+
+        // The instance is a handle to our GPU
+        // BackendBit::PRIMARY => Vulkan + Metal + DX12 + Browser WebGPU
         let instance = wgpu::Instance::new(wgpu::BackendBit::PRIMARY);
         let surface = unsafe { instance.create_surface(window) };
         let adapter = instance
@@ -297,7 +262,6 @@ impl State {
             })
             .await
             .unwrap();
-
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -305,7 +269,7 @@ impl State {
                     limits: wgpu::Limits::default(),
                     shader_validation: true,
                 },
-                None,
+                None, // Trace path
             )
             .await
             .unwrap();
@@ -319,13 +283,6 @@ impl State {
         };
 
         let swap_chain = device.create_swap_chain(&surface, &sc_desc);
-
-        let depth_texture =
-            texture::Texture::create_depth_texture(&device, &sc_desc, "depth_texture");
-
-        let diffuse_bytes = include_bytes!("happy-tree.png");
-        let diffuse_texture =
-            texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "happy-tree.png").unwrap();
 
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -349,23 +306,59 @@ impl State {
                 ],
                 label: Some("texture_bind_group_layout"),
             });
-        let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&diffuse_texture.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler),
-                },
-            ],
-            label: Some("diffuse_bind_group"),
+
+        let camera = Camera {
+            eye: (0.0, 5.0, -10.0).into(),
+            target: (0.0, 0.0, 0.0).into(),
+            up: cgmath::Vector3::unit_y(),
+            aspect: sc_desc.width as f32 / sc_desc.height as f32,
+            fovy: 45.0,
+            znear: 0.1,
+            zfar: 100.0,
+        };
+        let camera_controller = CameraController::new(0.2);
+
+        let mut uniforms = Uniforms::new();
+        uniforms.update_view_proj(&camera);
+
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
         });
 
-        let vs_module = device.create_shader_module(wgpu::include_spirv!("shader.vert.spv"));
-        let fs_module = device.create_shader_module(wgpu::include_spirv!("shader.frag.spv"));
+        const SPACE_BETWEEN: f32 = 3.0;
+        let instances = (0..NUM_INSTANCES_PER_ROW)
+            .flat_map(|z| {
+                (0..NUM_INSTANCES_PER_ROW).map(move |x| {
+                    let x = SPACE_BETWEEN * (x as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
+                    let z = SPACE_BETWEEN * (z as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
+
+                    let position = cgmath::Vector3 { x, y: 0.0, z };
+
+                    let rotation = if position.is_zero() {
+                        cgmath::Quaternion::from_axis_angle(
+                            cgmath::Vector3::unit_z(),
+                            cgmath::Deg(0.0),
+                        )
+                    } else {
+                        cgmath::Quaternion::from_axis_angle(
+                            position.clone().normalize(),
+                            cgmath::Deg(45.0),
+                        )
+                    };
+
+                    Instance { position, rotation }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
+        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Instance Buffer"),
+            contents: bytemuck::cast_slice(&instance_data),
+            usage: wgpu::BufferUsage::VERTEX,
+        });
 
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -381,12 +374,37 @@ impl State {
                 label: Some("uniform_bind_group_layout"),
             });
 
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &uniform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(uniform_buffer.slice(..)),
+            }],
+            label: Some("uniform_bind_group"),
+        });
+
+        let res_dir = std::path::Path::new(env!("OUT_DIR")).join("res");
+        let obj_model = model::Model::load(
+            &device,
+            &queue,
+            &texture_bind_group_layout,
+            res_dir.join("cube.obj"),
+        )
+        .unwrap();
+
+        let vs_module = device.create_shader_module(wgpu::include_spirv!("shader.vert.spv"));
+        let fs_module = device.create_shader_module(wgpu::include_spirv!("shader.frag.spv"));
+
+        let depth_texture =
+            texture::Texture::create_depth_texture(&device, &sc_desc, "depth_texture");
+
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
                 bind_group_layouts: &[&texture_bind_group_layout, &uniform_bind_group_layout],
                 push_constant_ranges: &[],
             });
+
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&render_pipeline_layout),
@@ -406,13 +424,13 @@ impl State {
                 depth_bias_clamp: 0.0,
                 clamp_depth: false,
             }),
+            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
             color_states: &[wgpu::ColorStateDescriptor {
                 format: sc_desc.format,
                 color_blend: wgpu::BlendDescriptor::REPLACE,
                 alpha_blend: wgpu::BlendDescriptor::REPLACE,
                 write_mask: wgpu::ColorWrite::ALL,
             }],
-            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
             depth_stencil_state: Some(wgpu::DepthStencilStateDescriptor {
                 format: texture::Texture::DEPTH_FORMAT,
                 depth_write_enabled: true,
@@ -420,95 +438,12 @@ impl State {
                 stencil: wgpu::StencilStateDescriptor::default(),
             }),
             vertex_state: wgpu::VertexStateDescriptor {
-                index_format: wgpu::IndexFormat::Uint16,
-                vertex_buffers: &[Vertex::desc(), InstanceRaw::desc()],
+                index_format: wgpu::IndexFormat::Uint32,
+                vertex_buffers: &[model::ModelVertex::desc(), InstanceRaw::desc()],
             },
             sample_count: 1,
             sample_mask: !0,
             alpha_to_coverage_enabled: false,
-        });
-
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
-            usage: wgpu::BufferUsage::VERTEX,
-        });
-
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(INDICES),
-            usage: wgpu::BufferUsage::INDEX,
-        });
-
-        let camera = Camera {
-            // position the camera one unit up and 2 units back
-            // +z is out of the screen
-            eye: (0.0, 1.0, 2.0).into(),
-            // have it look at the origin
-            target: (0.0, 0.0, 0.0).into(),
-            // which way is "up"
-            up: cgmath::Vector3::unit_y(),
-            aspect: sc_desc.width as f32 / sc_desc.height as f32,
-            fovy: 45.0,
-            znear: 0.1,
-            zfar: 100.0,
-        };
-        let camera_controller = CameraController::new(0.2);
-
-        let mut uniforms = Uniforms::new();
-        uniforms.update_view_proj(&camera);
-
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Uniform Buffer"),
-            contents: bytemuck::cast_slice(&[uniforms]),
-            usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
-        });
-
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &uniform_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(uniform_buffer.slice(..)),
-            }],
-            label: Some("uniform_bind_group"),
-        });
-
-        const NUM_INSTANCES_PER_ROW: u32 = 10;
-        const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new(
-            NUM_INSTANCES_PER_ROW as f32 * 0.5,
-            0.0,
-            NUM_INSTANCES_PER_ROW as f32 * 0.5,
-        );
-        let instances = (0..NUM_INSTANCES_PER_ROW)
-            .flat_map(|z| {
-                (0..NUM_INSTANCES_PER_ROW).map(move |x| {
-                    let position = cgmath::Vector3 {
-                        x: x as f32,
-                        y: 0.0,
-                        z: z as f32,
-                    } - INSTANCE_DISPLACEMENT;
-
-                    let rotation = if position.is_zero() {
-                        cgmath::Quaternion::from_axis_angle(
-                            cgmath::Vector3::unit_z(),
-                            cgmath::Deg(0.0),
-                        )
-                    } else {
-                        cgmath::Quaternion::from_axis_angle(
-                            position.clone().normalize(),
-                            cgmath::Deg(45.0),
-                        )
-                    };
-
-                    Instance { position, rotation }
-                })
-            })
-            .collect::<Vec<_>>();
-        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
-        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Instance Buffer"),
-            contents: bytemuck::cast_slice(&instance_data),
-            usage: wgpu::BufferUsage::VERTEX,
         });
 
         Self {
@@ -517,25 +452,22 @@ impl State {
             queue,
             sc_desc,
             swap_chain,
-            size,
-            depth_texture,
             render_pipeline,
-            vertex_buffer,
-            index_buffer,
-            indices_count: INDICES.len() as u32,
-            diffuse_bind_group,
-            diffuse_texture,
+            obj_model,
             camera,
             camera_controller,
-            uniforms,
             uniform_buffer,
             uniform_bind_group,
+            uniforms,
             instances,
             instance_buffer,
+            depth_texture,
+            size,
         }
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        self.camera.aspect = self.sc_desc.width as f32 / self.sc_desc.height as f32;
         self.size = new_size;
         self.sc_desc.width = new_size.width;
         self.sc_desc.height = new_size.height;
@@ -543,8 +475,7 @@ impl State {
         self.depth_texture =
             texture::Texture::create_depth_texture(&self.device, &self.sc_desc, "depth_texture");
     }
-
-    fn handle_input(&mut self, event: &WindowEvent) -> bool {
+    fn input(&mut self, event: &WindowEvent) -> bool {
         self.camera_controller.process_events(event)
     }
 
@@ -564,7 +495,7 @@ impl State {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("RENDER ENCODER"),
+                label: Some("Render Encoder"),
             });
 
         {
@@ -592,16 +523,16 @@ impl State {
                 }),
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.uniform_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..));
-            render_pass.draw_indexed(0..self.indices_count, 0, 0..self.instances.len() as _);
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.draw_model_instanced(
+                &self.obj_model,
+                0..self.instances.len() as u32,
+                &self.uniform_bind_group,
+            );
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.queue.submit(iter::once(encoder.finish()));
 
         Ok(())
     }
@@ -609,48 +540,58 @@ impl State {
 
 fn main() {
     let event_loop = EventLoop::new();
-    let window = WindowBuilder::new()
-        .with_title("WebGPU Experiments!")
+    let title = env!("CARGO_PKG_NAME");
+    let window = winit::window::WindowBuilder::new()
+        .with_title(title)
         .build(&event_loop)
         .unwrap();
 
+    use futures::executor::block_on;
     let mut state = block_on(State::new(&window));
-
-    event_loop.run(move |event, _, control_flow| match event {
-        Event::RedrawRequested(_) => {
-            state.update();
-            match state.render() {
-                Ok(_) => {}
-                Err(wgpu::SwapChainError::Lost) => state.resize(state.size),
-                Err(wgpu::SwapChainError::OutOfMemory) => *control_flow = ControlFlow::Exit,
-                Err(e) => eprintln!("{:?}", e),
-            }
-        }
-        Event::WindowEvent { event, .. } => {
-            if !state.handle_input(&event) {
-                match event {
-                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                    WindowEvent::KeyboardInput { input, .. } => match input {
-                        KeyboardInput {
-                            state: ElementState::Pressed,
-                            virtual_keycode: Some(VirtualKeyCode::Escape),
-                            ..
-                        } => *control_flow = ControlFlow::Exit,
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Poll;
+        match event {
+            Event::MainEventsCleared => window.request_redraw(),
+            Event::WindowEvent {
+                ref event,
+                window_id,
+            } if window_id == window.id() => {
+                if !state.input(event) {
+                    match event {
+                        WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                        WindowEvent::KeyboardInput { input, .. } => match input {
+                            KeyboardInput {
+                                state: ElementState::Pressed,
+                                virtual_keycode: Some(VirtualKeyCode::Escape),
+                                ..
+                            } => {
+                                *control_flow = ControlFlow::Exit;
+                            }
+                            _ => {}
+                        },
+                        WindowEvent::Resized(physical_size) => {
+                            state.resize(*physical_size);
+                        }
+                        WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                            state.resize(**new_inner_size);
+                        }
                         _ => {}
-                    },
-                    WindowEvent::Resized(physical_size) => {
-                        state.resize(physical_size);
                     }
-                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                        state.resize(*new_inner_size);
-                    }
-                    _ => {}
                 }
             }
+            Event::RedrawRequested(_) => {
+                state.update();
+                match state.render() {
+                    Ok(_) => {}
+                    // Recreate the swap_chain if lost
+                    Err(wgpu::SwapChainError::Lost) => state.resize(state.size),
+                    // The system is out of memory, we should probably quit
+                    Err(wgpu::SwapChainError::OutOfMemory) => *control_flow = ControlFlow::Exit,
+                    // All other errors (Outdated, Timeout) should be resolved by the next frame
+                    Err(e) => eprintln!("{:?}", e),
+                }
+            }
+            _ => {}
         }
-        Event::MainEventsCleared => {
-            window.request_redraw();
-        }
-        _ => {}
     });
 }
